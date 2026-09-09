@@ -1,0 +1,76 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===== LivePortrait 模型 & 缓存 =====
+LivePortrait/pretrained_weights/
+LivePortrait/ffmpeg/
+LivePortrait/assets/examples/driving/*.mp4
+LivePortrait/assets/examples/source/*.mp4
+LivePortrait/outputs/
+LivePortrait/temp/
+LivePortrait/logs/
+LivePortrait/__pycache__/
+
+# ===== Wav2Lip 模型 =====
+Wav2Lip/checkpoints/
+Wav2Lip/face_detection/detection/sfd/s3fd.pth
+Wav2Lip/__pycache__/
+Wav2Lip/logs/
+Wav2Lip/results/
+Wav2Lip/temp/
+
+# ===== FFmpeg =====
+ffmpeg/
+
+# ===== 3D Avatar 用户素材（先提交占位说明） =====
+3d_avatar/avatar/*.glb
+3d_avatar/avatar/*.gltf
+3d_avatar/avatar/*.fbx
+3d_avatar/avatar/*.vrm
+3d_avatar/animations/*.fbx
+3d_avatar/animations/*.glb
+3d_avatar/animations/*.bvh
+
+# ===== TTS 音频输出 =====
+3d_avatar/audio/*.mp3
+3d_avatar/audio/*.wav
+
+# ===== 通用输出 =====
+output/
+results/
+*.mp4
+*.webm
+*.avi
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== HuggingFace 缓存 =====
+.cache/huggingface/
+
+# ===== Conda =====
+conda-meta/
+
+# ===== 内部 .git 目录 =====
+LivePortrait/.git/
+Wav2Lip/.git/

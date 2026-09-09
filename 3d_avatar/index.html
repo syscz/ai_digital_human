@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>3D 数字人 - Three.js + Mixamo + Web Audio</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #1a1a2e; font-family: -apple-system, sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            background: rgba(26, 26, 46, 0.9); color: #fff;
+            padding: 20px; border-radius: 12px; max-width: 360px;
+            backdrop-filter: blur(10px);
+        }
+        #ui h2 { margin: 0 0 12px 0; font-size: 16px; color: #e94560; }
+        #ui label { font-size: 12px; color: #aaa; display: block; margin-top: 8px; }
+        #ui select, #ui input[type="text"], #ui textarea {
+            width: 100%; padding: 8px; margin-top: 4px;
+            background: #16213e; border: 1px solid #0f3460;
+            color: #fff; border-radius: 6px; box-sizing: border-box;
+            font-size: 13px;
+        }
+        #ui textarea { height: 60px; resize: vertical; }
+        #ui button {
+            background: #e94560; color: #fff; border: none; padding: 10px 20px;
+            border-radius: 6px; cursor: pointer; margin-top: 12px;
+            font-size: 14px; font-weight: bold; width: 100%;
+        }
+        #ui button:hover { background: #ff6b8a; }
+        #ui button:disabled { background: #555; cursor: not-allowed; }
+        #status {
+            position: absolute; bottom: 20px; left: 20px; z-index: 10;
+            background: rgba(26, 26, 46, 0.8); color: #4ecca3;
+            padding: 10px 16px; border-radius: 8px; font-size: 12px;
+            font-family: monospace;
+        }
+        #audio-control {
+            position: absolute; bottom: 20px; right: 20px; z-index: 10;
+            background: rgba(26, 26, 46, 0.9); padding: 12px; border-radius: 12px;
+            color: #fff;
+        }
+        .audio-energy {
+            width: 200px; height: 6px; background: #0f3460; border-radius: 3px;
+            margin-top: 8px; overflow: hidden;
+        }
+        .audio-energy-bar {
+            height: 100%; background: #e94560; width: 0%; transition: width 30ms;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <!-- 控制面板 -->
+    <div id="ui">
+        <h2>🎬 3D 数字人控制台</h2>
+
+        <label>Avatar 文件 (GLB)</label>
+        <select id="avatar-select">
+            <option value="avatar/default.glb">默认 (请先在 avatar/ 目录放 .glb)</option>
+        </select>
+
+        <label>动作文件 (FBX)</label>
+        <select id="anim-select">
+            <option value="">— 不使用身体动作 —</option>
+        </select>
+
+        <label>要说的话</label>
+        <textarea id="text-input" placeholder="你好，我是3D数字人...">你好，我是3D数字人，很高兴见到你！</textarea>
+
+        <label>语音</label>
+        <select id="voice-select">
+            <option value="zh-CN-XiaoxiaoNeural">女声-亲切</option>
+            <option value="zh-CN-XiaoyiNeural">女声-温柔</option>
+            <option value="zh-CN-YunxiNeural">男声-新闻</option>
+            <option value="zh-CN-YunjianNeural">男声-年轻</option>
+            <option value="zh-CN-YunyangNeural">男声-稳重</option>
+        </select>
+
+        <button id="generate-btn">🚀 生成语音 + 播放</button>
+        <button id="load-demo-btn" style="background:#0f3460;margin-top:8px">📂 加载 demo 音频</button>
+    </div>
+
+    <!-- 状态 -->
+    <div id="status">等待加载...</div>
+
+    <!-- 音频能量可视化 -->
+    <div id="audio-control">
+        <div style="font-size:12px;color:#aaa">嘴型驱动强度</div>
+        <div class="audio-energy"><div class="audio-energy-bar" id="energy-bar"></div></div>
+    </div>
+
+    <!-- Three.js 相关库 (CDN) -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ========== 全局变量 ==========
+        let scene, camera, renderer, controls;
+        let avatar = null;           // Avatar root object
+        let mixer = null;            // AnimationMixer
+        let bodyActions = [];        // 身体动画 clips
+        let mouthOpen = 0;           // 当前嘴张开程度 0-1
+        let jawBone = null;          // jaw bone 或 head bone
+
+        // Audio
+        let audioContext = null;
+        let analyser = null;
+        let sourceNode = null;
+        let audioElement = null;
+        let audioData = null;
+
+        // ========== 初始化场景 ==========
+        function initScene() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+            scene.fog = new THREE.Fog(0x1a1a2e, 5, 20);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 1.6, 3);  // 正对人体上半身
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // 控制器
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 1.2, 0);
+            controls.enableDamping = true;
+            controls.minDistance = 1.5;
+            controls.maxDistance = 8;
+
+            // 光照
+            const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444466, 0.7);
+            scene.add(hemiLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight.position.set(3, 5, 2);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 1024;
+            dirLight.shadow.mapSize.height = 1024;
+            scene.add(dirLight);
+
+            const rimLight = new THREE.DirectionalLight(0x4488ff, 0.5);
+            rimLight.position.set(-3, 3, -2);
+            scene.add(rimLight);
+
+            // 地面
+            const groundGeo = new THREE.PlaneGeometry(20, 20);
+            const groundMat = new THREE.MeshStandardMaterial({ color: 0x0f3460, roughness: 0.9 });
+            const ground = new THREE.Mesh(groundGeo, groundMat);
+            ground.rotation.x = -Math.PI / 2;
+            ground.position.y = 0;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            // 处理窗口大小
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        // ========== 加载 GLB Avatar ==========
+        function loadAvatar(url) {
+            return new Promise((resolve, reject) => {
+                const loader = new GLTFLoader();
+                loader.load(url, (gltf) => {
+                    avatar = gltf.scene;
+
+                    // 开启阴影
+                    avatar.traverse(child => {
+                        if (child.isMesh) {
+                            child.castShadow = true;
+                            child.receiveShadow = true;
+                        }
+                    });
+
+                    // 居中 & 对齐脚底到 y=0
+                    const box = new THREE.Box3().setFromObject(avatar);
+                    const size = box.getSize(new THREE.Vector3());
+                    const center = box.getCenter(new THREE.Vector3());
+                    avatar.position.x = -center.x;
+                    avatar.position.z = -center.z;
+                    avatar.position.y = -box.min.y;  // 脚底到原点
+
+                    scene.add(avatar);
+
+                    // 找 jaw / head bone
+                    jawBone = findBoneByName(avatar, ['jaw', 'Jaw', 'head', 'Head', 'neck', 'Neck']);
+                    console.log('Found facial bone:', jawBone ? jawBone.name : 'not found');
+
+                    // 如果有自带的 idle 动画
+                    if (gltf.animations && gltf.animations.length > 0) {
+                        mixer = new THREE.AnimationMixer(avatar);
+                        gltf.animations.forEach(clip => {
+                            const action = mixer.clipAction(clip);
+                            action.play();
+                        });
+                    }
+
+                    setStatus(`✅ Avatar loaded (${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)})`);
+                    resolve(avatar);
+                }, null, reject);
+            });
+        }
+
+        function findBoneByName(root, keywords) {
+            let result = null;
+            root.traverse(child => {
+                if (result) return;
+                if (child.isBone || child.isSkinnedMesh) {
+                    const name = child.name.toLowerCase();
+                    if (keywords.some(k => name.includes(k.toLowerCase()))) {
+                        result = child;
+                    }
+                }
+            });
+            if (!result) {
+                // 退而求其次：找最后一个 bone
+                root.traverse(child => {
+                    if (!result && child.isBone && child.name.toLowerCase().includes('head')) {
+                        result = child;
+                    }
+                });
+            }
+            return result;
+        }
+
+        // ========== 加载 Mixamo FBX 动作 ==========
+        function loadAnimation(url) {
+            return new Promise((resolve, reject) => {
+                const loader = new FBXLoader();
+                loader.load(url, (fbx) => {
+                    const clips = fbx.animations;
+                    if (!clips || clips.length === 0) {
+                        resolve(null);
+                        return;
+                    }
+
+                    if (!mixer) mixer = new THREE.AnimationMixer(avatar);
+
+                    // 把 FBX clip 应用到 Avatar 的骨骼上（动作重定向）
+                    clips.forEach(clip => {
+                        // 裁剪到合适长度
+                        const action = mixer.clipAction(clip);
+                        action.clampWhenFinished = true;
+                        action.loop = THREE.LoopRepeat;
+                        bodyActions.push(action);
+                        action.play();
+                    });
+
+                    setStatus(`✅ 动作已加载 (${clips.length} clip)`);
+                    resolve(clips);
+                }, null, reject);
+            });
+        }
+
+        // ========== Web Audio 口型驱动 ==========
+        async function setupAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+            return audioContext;
+        }
+
+        async function playAudioAndDriveLipSync(audioUrl) {
+            const ctx = await setupAudio();
+
+            // 清掉之前的
+            if (audioElement) {
+                audioElement.pause();
+                audioElement.src = '';
+            }
+            if (sourceNode) {
+                sourceNode.disconnect();
+            }
+
+            // 创建音频元素
+            audioElement = new Audio();
+            audioElement.src = audioUrl;
+            audioElement.crossOrigin = 'anonymous';
+            audioElement.playbackRate = 1;
+
+            // Analyser
+            analyser = ctx.createAnalyser();
+            analyser.fftSize = 256;
+            analyser.smoothingTimeConstant = 0.7;
+
+            sourceNode = ctx.createMediaElementSource(audioElement);
+            sourceNode.connect(analyser);
+            analyser.connect(ctx.destination);
+
+            audioData = new Uint8Array(analyser.frequencyBinCount);
+
+            audioElement.play().catch(err => {
+                console.warn('Autoplay blocked. Click page to play.', err);
+            });
+        }
+
+        function computeMouthOpen() {
+            if (!analyser || !audioData) {
+                // 平滑回落
+                mouthOpen *= 0.9;
+                return mouthOpen;
+            }
+
+            analyser.getByteFrequencyData(audioData);
+
+            // 主要能量集中在人声频段（100Hz - 4000Hz 约占 50% 采样点）
+            // fftSize=256, sampleRate=44100 → 每个 bin ~172Hz
+            // 取前 24 个 bin (~4125Hz)
+            let sum = 0;
+            const vocalBins = Math.min(24, audioData.length);
+            for (let i = 0; i < vocalBins; i++) {
+                sum += audioData[i];
+            }
+            const avg = sum / vocalBins / 255;  // 归一化到 0-1
+
+            // 非线性映射：log 压缩 + 缩放
+            // 人声能量一般在 0.1-0.5 之间，映射到嘴张开 0.1-0.7
+            let mouth = Math.pow(avg, 0.6) * 1.2;
+
+            // 平滑
+            mouthOpen = mouthOpen * 0.3 + mouth * 0.7;
+            mouthOpen = Math.max(0, Math.min(1, mouthOpen));
+
+            // UI
+            document.getElementById('energy-bar').style.width = (mouthOpen * 100).toFixed(0) + '%';
+
+            return mouthOpen;
+        }
+
+        // ========== 应用嘴型到 Avatar ==========
+        function applyMouthAnimation() {
+            if (!avatar) return;
+
+            const mouth = computeMouthOpen();
+
+            // 方法 1: 找 jaw bone 做旋转（如果有骨骼）
+            if (jawBone) {
+                // jaw 骨头绕 x 轴旋转，负角度是张嘴
+                jawBone.rotation.x = -mouth * 0.5;  // 最大旋转 ~0.5 rad
+            }
+
+            // 方法 2: 找 blendShape / morphTarget（Ready Player Me 通常有 ARKit jawOpen）
+            avatar.traverse(child => {
+                if (child.isSkinnedMesh && child.morphTargetDictionary) {
+                    // ARKit 52 blendshapes 里 jawOpen 通常是 index 33
+                    // 也可能通过名称 'jawOpen' 找到
+                    const dict = child.morphTargetDictionary;
+                    if ('jawOpen' in dict) {
+                        const idx = dict['jawOpen'];
+                        child.morphTargetInfluences[idx] = mouth;
+                    }
+                    // 也尝试 mouthOpen
+                    if ('mouthOpen' in dict) {
+                        const idx = dict['mouthOpen'];
+                        child.morphTargetInfluences[idx] = mouth;
+                    }
+                }
+            });
+        }
+
+        // ========== 主循环 ==========
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+
+            if (mixer) {
+                mixer.update(delta);
+            }
+
+            applyMouthAnimation();
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // ========== UI 事件 ==========
+        function setStatus(msg) {
+            document.getElementById('status').textContent = msg;
+            console.log(msg);
+        }
+
+        async function refreshFileList() {
+            // 从后端获取可用的 avatar 和 animation 文件列表
+            try {
+                const resp = await fetch('/api/files');
+                const data = await resp.json();
+
+                const avatarSelect = document.getElementById('avatar-select');
+                avatarSelect.innerHTML = '';
+                data.avatars.forEach(f => {
+                    const opt = document.createElement('option');
+                    opt.value = f;
+                    opt.textContent = f.split('/').pop();
+                    avatarSelect.appendChild(opt);
+                });
+                if (data.avatars.length === 0) {
+                    avatarSelect.innerHTML = '<option value="">(请先在 avatar/ 目录放 .glb 文件)</option>';
+                }
+
+                const animSelect = document.getElementById('anim-select');
+                animSelect.innerHTML = '<option value="">— 不使用身体动作 —</option>';
+                data.animations.forEach(f => {
+                    const opt = document.createElement('option');
+                    opt.value = f;
+                    opt.textContent = f.split('/').pop();
+                    animSelect.appendChild(opt);
+                });
+            } catch (e) {
+                console.warn('Could not fetch file list (no backend running?)', e);
+            }
+        }
+
+        document.getElementById('avatar-select').addEventListener('change', async (e) => {
+            if (avatar) {
+                scene.remove(avatar);
+                // 清除旧动画
+                if (mixer) mixer.stopAllAction();
+                mixer = null;
+                bodyActions = [];
+            }
+            if (e.target.value) {
+                await loadAvatar(e.target.value);
+            }
+        });
+
+        document.getElementById('anim-select').addEventListener('change', async (e) => {
+            if (mixer) mixer.stopAllAction();
+            bodyActions = [];
+            if (e.target.value) {
+                await loadAnimation(e.target.value);
+            }
+        });
+
+        document.getElementById('generate-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('generate-btn');
+            btn.disabled = true;
+
+            const text = document.getElementById('text-input').value;
+            const voice = document.getElementById('voice-select').value;
+
+            setStatus('🎙️  请求 TTS 合成...');
+            try {
+                const resp = await fetch('/api/tts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text, voice }),
+                });
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+
+                setStatus('✅ 语音生成成功，播放中...');
+                await playAudioAndDriveLipSync(data.url);
+            } catch (err) {
+                setStatus('❌ 失败: ' + err.message + ' (后端是否已启动？python server.py)');
+            }
+            btn.disabled = false;
+        });
+
+        document.getElementById('load-demo-btn').addEventListener('click', async () => {
+            setStatus('📂 播放 demo 音频 (请放在 audio/demo.mp3)...');
+            await playAudioAndDriveLipSync('audio/demo.mp3');
+        });
+
+        // ========== 启动 ==========
+        async function boot() {
+            initScene();
+            animate();
+            await refreshFileList();
+            setStatus('✅ Three.js 场景就绪 — 请通过 UI 选择 Avatar 和动作');
+        }
+
+        boot().catch(err => {
+            console.error('Boot failed:', err);
+            setStatus('❌ 启动失败: ' + err.message);
+        });
+    </script>
+</body>
+</html>
