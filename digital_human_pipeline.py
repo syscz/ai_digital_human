@@ -215,14 +215,16 @@ async def run_pipeline(
     """
     # 准备输出目录
     if output_dir is None:
-        output_dir = str(PROJECT_ROOT / "output")
-    os.makedirs(output_dir, exist_ok=True)
+        output_dir = PROJECT_ROOT / "output"
+    else:
+        output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 用时间戳避免文件名冲突
     import time
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    audio_path = os.path.join(output_dir, f"speech_{timestamp}.wav")
-    video_path = os.path.join(output_dir, f"talking_{timestamp}.mp4")
+    audio_path = str(output_dir / f"speech_{timestamp}.wav")
+    video_path = str(output_dir / f"talking_{timestamp}.mp4")
 
     print("\n" + "=" * 60)
     print(f"🚀 AI 数字人流水线启动")
@@ -312,7 +314,7 @@ def launch_gradio():
 
         with gr.Row():
             with gr.Column():
-                photo = gr.Image(label="📷 源图片", type="filepath")
+                photo = gr.Image(label="📷 源图片")
                 text = gr.Textbox(label="📝 要说的话", value="你好，我是数字人，很高兴见到你！", lines=3)
                 voice = gr.Dropdown(
                     label="🎙️ 语音选择",
@@ -323,6 +325,27 @@ def launch_gradio():
 
             with gr.Column():
                 output_video = gr.Video(label="🎥 生成的说话视频")
+
+        def process(image, text, voice_label):
+            """Gradio 处理函数"""
+            # Gradio 4.x 里 Image 返回 PIL.Image 或文件路径，需要转成临时文件
+            if isinstance(image, str):
+                photo_path = image
+            else:
+                # PIL Image → 存为临时文件
+                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                image.save(tmp.name)
+                tmp.close()
+                photo_path = tmp.name
+
+            voice = CHINESE_VOICES[voice_label]
+            result = asyncio.run(run_pipeline(
+                photo_path=photo_path,
+                text=text,
+                voice=voice,
+                output_dir=str(PROJECT_ROOT / "output"),
+            ))
+            return result["video"]
 
         btn.click(
             fn=process,
@@ -338,7 +361,23 @@ def launch_gradio():
         4. 点击"生成视频"（CPU 模式约需 20-60 秒，取决于视频长度）
         """)
 
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    # 代理环境下 share=True 创建公网隧道，否则 localhost 检测会失败
+    # 端口冲突时自动 +1 重试
+    for port in range(7860, 7880):
+        try:
+            demo.launch(server_name="127.0.0.1", server_port=port, share=False, inbrowser=True)
+            break
+        except OSError as e:
+            if "Cannot find empty port" in str(e) or "WinError 10048" in str(e):
+                print(f"⚠️  端口 {port} 被占用，尝试 {port + 1}...")
+                continue
+            # 其他 OSError 不重试（比如 localhost 不可访问）
+            print(f"⚠️  本地启动失败: {e}，尝试 share=True 公网模式...")
+            demo.launch(server_name="0.0.0.0", server_port=port, share=True)
+            break
+    else:
+        print("❌ 7860-7879 端口全部被占用，请手动关闭旧进程")
+        print("   Windows: netstat -ano | findstr :7860   → taskkill /PID <pid> /F")
 
 
 if __name__ == "__main__":
