@@ -256,8 +256,8 @@ async def run_pipeline(
 # ========== CLI 入口 ==========
 def main_cli():
     parser = argparse.ArgumentParser(description="AI 数字人端到端流水线")
-    parser.add_argument("--photo", required=True, help="源图片路径 (jpg/png)")
-    parser.add_argument("--text", required=True, help="要说的话")
+    parser.add_argument("--photo", default=None, help="源图片路径 (jpg/png)")
+    parser.add_argument("--text", default=None, help="要说的话")
     parser.add_argument("--voice", default="zh-CN-XiaoxiaoNeural",
                         help="Edge-TTS 语音，默认 zh-CN-XiaoxiaoNeural")
     parser.add_argument("--output", default=None, help="输出视频路径 (默认 output/talking_时间戳.mp4)")
@@ -269,6 +269,10 @@ def main_cli():
     if args.gradio:
         launch_gradio()
         return
+
+    # 命令行模式下 photo 和 text 必填
+    if not args.photo or not args.text:
+        parser.error("--photo 和 --text 是命令行模式下的必填参数（Gradio 模式用 --gradio 启动）")
 
     if not check_prerequisites():
         sys.exit(1)
