@@ -9,7 +9,7 @@ AI 数字人端到端流水线
 
 使用方式：
   # 命令行
-  python digital_human_pipeline.py --photo photo.jpg --text "你好，我是数字人" --voice zh-CN-XiaoxiaoNeural --output result.mp4
+  python digital_human_pipeline.py --photo photo.jpg --text "你好，我是数字人" --voice zh-CN-XiaoxiaoNeural --output ./output
 
   # Gradio 界面
   python digital_human_pipeline.py --gradio
@@ -262,7 +262,7 @@ def main_cli():
     parser.add_argument("--text", default=None, help="要说的话")
     parser.add_argument("--voice", default="zh-CN-XiaoxiaoNeural",
                         help="Edge-TTS 语音，默认 zh-CN-XiaoxiaoNeural")
-    parser.add_argument("--output", default=None, help="输出视频路径 (默认 output/talking_时间戳.mp4)")
+    parser.add_argument("--output", default=None, help="输出目录 (默认 output/，文件名为 talking_时间戳.mp4)")
     parser.add_argument("--checkpoint", default=None, help="Wav2Lip 模型路径 (默认 checkpoints/wav2lip.pth)")
     parser.add_argument("--gradio", action="store_true", help="启动 Gradio 界面")
 
@@ -283,7 +283,7 @@ def main_cli():
         photo_path=args.photo,
         text=args.text,
         voice=args.voice,
-        output_dir=str(PROJECT_ROOT / "output"),
+        output_dir=args.output or str(PROJECT_ROOT / "output"),
         wav2lip_checkpoint=args.checkpoint,
     ))
 
@@ -298,23 +298,12 @@ def launch_gradio():
         print("请先安装 gradio: conda activate LivePortrait && pip install gradio")
         sys.exit(1)
 
-    def process(photo, text, voice_label):
-        """Gradio 处理函数"""
-        voice = CHINESE_VOICES[voice_label]
-        result = asyncio.run(run_pipeline(
-            photo_path=photo,
-            text=text,
-            voice=voice,
-            output_dir=str(PROJECT_ROOT / "output"),
-        ))
-        return result["video"]
-
     with gr.Blocks(title="AI 数字人 - 文本生成说话视频") as demo:
         gr.Markdown("# 🎬 AI 数字人\n上传一张照片 + 输入文字，生成说话视频（Wav2Lip + Edge-TTS）")
 
         with gr.Row():
             with gr.Column():
-                photo = gr.Image(label="📷 源图片")
+                photo = gr.Image(label="📷 源图片", type="pil")
                 text = gr.Textbox(label="📝 要说的话", value="你好，我是数字人，很高兴见到你！", lines=3)
                 voice = gr.Dropdown(
                     label="🎙️ 语音选择",
@@ -328,24 +317,34 @@ def launch_gradio():
 
         def process(image, text, voice_label):
             """Gradio 处理函数"""
-            # Gradio 4.x 里 Image 返回 PIL.Image 或文件路径，需要转成临时文件
-            if isinstance(image, str):
-                photo_path = image
-            else:
-                # PIL Image → 存为临时文件
-                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-                image.save(tmp.name)
-                tmp.close()
-                photo_path = tmp.name
+            # Gradio 4.x 里 Image(type="pil") 返回 PIL.Image，需要转成临时文件
+            photo_path = image if isinstance(image, str) else None
+            tmp_name = None
+            if photo_path is None:
+                # PIL Image → 存为临时文件。
+                # 用 mkstemp 拿到 fd 后立即 os.close，确保 Windows 下文件句柄不占用，
+                # 再交给 PIL 写入，避免后续 Wav2Lip 读取时被句柄锁住。
+                fd, tmp_name = tempfile.mkstemp(suffix=".jpg")
+                os.close(fd)
+                image.save(tmp_name)
+                photo_path = tmp_name
 
-            voice = CHINESE_VOICES[voice_label]
-            result = asyncio.run(run_pipeline(
-                photo_path=photo_path,
-                text=text,
-                voice=voice,
-                output_dir=str(PROJECT_ROOT / "output"),
-            ))
-            return result["video"]
+            try:
+                voice = CHINESE_VOICES[voice_label]
+                result = asyncio.run(run_pipeline(
+                    photo_path=photo_path,
+                    text=text,
+                    voice=voice,
+                    output_dir=str(PROJECT_ROOT / "output"),
+                ))
+                return result["video"]
+            finally:
+                # 清理临时图片，避免每次生成残留文件
+                if tmp_name and os.path.exists(tmp_name):
+                    try:
+                        os.remove(tmp_name)
+                    except OSError:
+                        pass
 
         btn.click(
             fn=process,
