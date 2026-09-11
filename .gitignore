@@ -74,3 +74,6 @@ conda-meta/
 # ===== 内部 .git 目录 =====
 LivePortrait/.git/
 Wav2Lip/.git/
+
+# ===== 运行日志 =====
+*.log
