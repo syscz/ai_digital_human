@@ -42,6 +42,16 @@ Wav2Lip/temp/
 # ===== FFmpeg =====
 ffmpeg/
 
+# ===== GFPGAN 模型 =====
+gfpgan_weights/
+gfpgan/
+
+# ===== SadTalker（含模型/产物，嵌套 .git 不纳入主仓库） =====
+SadTalker/.git/
+SadTalker/checkpoints/
+SadTalker/gfpgan/weights/
+SadTalker/results/
+
 # ===== 3D Avatar 用户素材（先提交占位说明） =====
 3d_avatar/avatar/*.glb
 3d_avatar/avatar/*.gltf
