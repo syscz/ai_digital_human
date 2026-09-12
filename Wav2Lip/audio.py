@@ -2,6 +2,7 @@ import librosa
 import librosa.filters
 import numpy as np
 # import tensorflow as tf
+import soundfile as sf
 from scipy import signal
 from scipy.io import wavfile
 from hparams import hparams as hp
@@ -15,7 +16,8 @@ def save_wav(wav, path, sr):
     wavfile.write(path, sr, wav.astype(np.int16))
 
 def save_wavenet_wav(wav, path, sr):
-    librosa.output.write_wav(path, wav, sr=sr)
+    # 新版 librosa (0.10+) 移除了 librosa.output，改用 soundfile 写 float 波形
+    sf.write(path, wav, sr)
 
 def preemphasis(wav, k, preemphasize=True):
     if preemphasize:
@@ -97,7 +99,8 @@ def _linear_to_mel(spectogram):
 
 def _build_mel_basis():
     assert hp.fmax <= hp.sample_rate // 2
-    return librosa.filters.mel(hp.sample_rate, hp.n_fft, n_mels=hp.num_mels,
+    # 新版 librosa (0.10+) 的 mel() 参数全为 keyword-only，需用关键字传参
+    return librosa.filters.mel(sr=hp.sample_rate, n_fft=hp.n_fft, n_mels=hp.num_mels,
                                fmin=hp.fmin, fmax=hp.fmax)
 
 def _amp_to_db(x):
