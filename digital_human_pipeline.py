@@ -530,6 +530,7 @@ async def run_pipeline(
     enable_gfpgan: bool = True,
     gfpgan_weight: float = 0.5,
     enable_interpolation: bool = True,
+    keep_intermediate: bool = False,
 ) -> dict:
     """
     端到端流水线：文本 + 照片 → 说话视频
@@ -550,6 +551,8 @@ async def run_pipeline(
         enable_gfpgan: 是否用 GFPGAN 做人脸修复（解决嘴部模糊）
         gfpgan_weight: GFPGAN 修复力度 0~1（越小越保留本人相貌）
         enable_interpolation: 是否在头动链路末尾插帧到 50fps（更顺滑）
+        keep_intermediate: 保留 SadTalker 中间视频（expressive_*.mp4）；
+            默认流水线成功后删除，失败时始终保留以便排查
 
     Returns:
         dict: {"audio": "xxx.wav", "video": "xxx.mp4"}
@@ -582,6 +585,7 @@ async def run_pipeline(
         # Step 1: 语音合成
         await text_to_speech(text, voice, audio_path)
 
+        sad_path = None
         if enable_sadtalker:
             # Step 2a: SadTalker 生成带表情/头动的视频（嘴型不准）
             sad_path = str(output_dir / f"expressive_{timestamp}.mp4")
@@ -616,7 +620,15 @@ async def run_pipeline(
         print(f"🎉 流水线完成！")
         print(f"   音频: {audio_path}")
         print(f"   视频: {video_path}")
-        print("=" * 60)
+        print("=" * 60 + "\n")
+
+        # 成功后才清理中间视频；失败路径走 except，不删除（保留排查现场）
+        if sad_path and not keep_intermediate:
+            try:
+                os.remove(sad_path)
+                print(f"🧹  已清理中间文件: {sad_path}")
+            except OSError:
+                pass
 
         return {"audio": audio_path, "video": video_path}
 
@@ -645,6 +657,8 @@ def main_cli():
                         help="SadTalker 渲染分辨率（默认 512，更像本人；256 更快）")
     parser.add_argument("--no-interpolation", action="store_true",
                         help="关闭 50fps 运动插帧（默认开启，仅在 SadTalker 链路生效）")
+    parser.add_argument("--keep-intermediate", action="store_true",
+                        help="保留 SadTalker 中间视频 expressive_*.mp4（默认成功后删除）")
     parser.add_argument("--gfpgan-weight", type=float, default=0.5,
                         help="GFPGAN 修复力度 0~1（默认 0.5，越小越保留本人相貌）")
     parser.add_argument("--gradio", action="store_true", help="启动 Gradio 界面")
@@ -674,6 +688,7 @@ def main_cli():
         enable_gfpgan=not args.no_gfpgan,
         gfpgan_weight=args.gfpgan_weight,
         enable_interpolation=not args.no_interpolation,
+        keep_intermediate=args.keep_intermediate,
     ))
 
     print(f"\n🎬 生成的视频: {result['video']}")
