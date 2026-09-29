@@ -10,7 +10,7 @@
 |------|---------|------|------|
 | **2D 面部动画（视频驱动）** | LivePortrait（快手可灵） | 图片 + 驱动视频 | 带表情/头部/眨眼的说话视频 |
 | **2D 面部动画（音频驱动）** | Wav2Lip | 图片 + 音频 | 嘴型同步视频 |
-| **2D 端到端流水线** | Edge-TTS + Wav2Lip | 图片 + 文字 | 说话视频 MP4 |
+| **2D 端到端流水线** | Edge-TTS + SadTalker + Wav2Lip + GFPGAN | 图片 + 文字 | 带表情/头动的高清说话视频 MP4 |
 | **3D 全身数字人** | Ready Player Me + Mixamo + Three.js | 3D Avatar + Mixamo 动作 | 浏览器实时渲染的 3D 数字人 |
 
 ---
@@ -19,18 +19,27 @@
 
 ```
 ai_digital_human/
-├── digital_human_pipeline.py    ← 2D 端到端流水线（Edge-TTS → Wav2Lip → 视频）
+├── digital_human_pipeline.py    ← 2D 端到端流水线（Edge-TTS → SadTalker → Wav2Lip → GFPGAN → 插帧）
 ├── 项目信息.md                    ← 详细技术文档（模型原理、硬件清单等）
 │
-├── LivePortrait/                ← 快手可灵出品，16.7k⭐
+├── LivePortrait/                ← 快手可灵出品，16.7k⭐（独立工具，未接入流水线）
 │   ├── inference.py               命令行推理入口
 │   ├── app.py                     Gradio 可视化界面
 │   └── src/                       核心源码
 │
-├── Wav2Lip/                     ← Rudrabha/Wav2Lip，10k⭐
+├── SadTalker/                   ← OpenTalker/SadTalker，13k⭐（流水线的表情/头动生成）
+│   ├── inference.py               推理入口（被流水线调用）
+│   └── src/                       核心源码
+│
+├── Wav2Lip/                     ← Rudrabha/Wav2Lip，10k⭐（流水线的嘴型精修）
 │   ├── inference.py               音频驱动推理入口
 │   ├── models/                    Wav2Lip 模型定义
 │   └── audio.py                   音频处理
+│
+├── gfpgan_weights/              ← GFPGANv1.4 人脸修复模型
+├── gfpgan/weights/              ← facexlib 辅助模型（人脸检测/解析）
+├── ffmpeg/                      ← 本地静态 ffmpeg（绕开 conda ffmpeg 的 DLL 冲突）
+├── output/                      ← 流水线输出（音频 + 最终视频）
 │
 └── 3d_avatar/                   ← 3D 全身数字人（第一阶段）
     ├── index.html                 Three.js 前端
@@ -98,6 +107,16 @@ huggingface-cli download KlingTeam/LivePortrait --local-dir pretrained_weights -
 # Wav2Lip 模型 (~415MB)
 # 下载 wav2lip.pth 放到 Wav2Lip/checkpoints/
 # 下载 s3fd.pth 放到 Wav2Lip/face_detection/detection/sfd/
+
+# SadTalker 模型（流水线需要）
+# 下载 SadTalker_V0.0.2_256.safetensors / SadTalker_V0.0.2_512.safetensors (~692MB each)、
+#       mapping_00109-model.pth.tar (~149MB)、BFM_Fitting/ 整个目录 → SadTalker/checkpoints/
+# 来源：ModelScope wwd123/sadtalker 或 GitHub OpenTalker/SadTalker 的 bag-of-bits release
+
+# GFPGAN 模型（流水线需要）
+# GFPGANv1.4.pth (~333MB) → gfpgan_weights/
+# detection_Resnet50_Final.pth + parsing_parsenet.pth (facexlib) → gfpgan/weights/
+
 # 详见 项目信息.md 的模型下载来源章节
 ```
 
@@ -126,13 +145,25 @@ python inference.py --checkpoint_path checkpoints/wav2lip.pth --face your_photo.
 conda activate LivePortrait
 cd d:\Work\Python\ai_digital_human
 
-# 命令行
+# 命令行（完整链路：SadTalker 表情/头动 → Wav2Lip 精修嘴型 → GFPGAN 修复 → 50fps 插帧）
 python digital_human_pipeline.py --photo your_photo.jpg --text "你好，我是数字人" --voice zh-CN-XiaoxiaoNeural
+
+# 快速链路（--no-sadtalker：只有嘴动，CPU 上快约一个量级）
+python digital_human_pipeline.py --photo your_photo.jpg --text "你好" --no-sadtalker
+
+# 其他常用开关
+#   --sadtalker-size 256     SadTalker 用 256 渲染（更快，略不像本人）
+#   --sadtalker-still        减少头部摆动（稳重口播风）
+#   --no-gfpgan              关闭人脸修复
+#   --no-interpolation       关闭 50fps 插帧
+#   --keep-intermediate      保留 SadTalker 中间视频（默认成功后删除）
 
 # Gradio 界面
 python digital_human_pipeline.py --gradio
 # 浏览器打开 http://localhost:7860
 ```
+
+> ⏱ CPU 性能参考（无 NVIDIA GPU）：完整链路一段 15 秒语音约十几分钟（SadTalker 512 + 逐帧 GFPGAN 是大头）；`--no-sadtalker` 快速链路约 1-3 分钟。
 
 #### 方式 D：3D 全身数字人（浏览器实时渲染）
 
@@ -155,8 +186,10 @@ python server.py
 
 | 模块 | 技术 | 说明 |
 |------|------|------|
-| 面部动画（视频驱动） | [LivePortrait](https://github.com/KwaiVGI/LivePortrait) | 快手可灵出品，SOTA 效果 |
-| 面部动画（音频驱动） | [Wav2Lip](https://github.com/Rudrabha/Wav2Lip) | 经典对口型模型 |
+| 面部动画（视频驱动） | [LivePortrait](https://github.com/KwaiVGI/LivePortrait) | 快手可灵出品，SOTA 效果（独立工具） |
+| 表情/头动生成 | [SadTalker](https://github.com/OpenTalker/SadTalker) | 音频驱动表情、眨眼与头部运动 |
+| 面部动画（音频驱动） | [Wav2Lip](https://github.com/Rudrabha/Wav2Lip) | 经典对口型模型，精修嘴型 |
+| 人脸修复 | [GFPGAN](https://github.com/TencentARC/GFPGAN) | 消除 Wav2Lip 嘴部模糊，逐帧修复 + 检测框平滑 |
 | 语音合成 | [Edge-TTS](https://github.com/rany2/edge-tts) | 微软 Edge 免费 TTS，国内可用 |
 | 3D 渲染 | [Three.js](https://threejs.org/) | 浏览器端 WebGL 实时渲染 |
 | 3D Avatar | [Ready Player Me](https://readyplayer.me) | AI 生成 3D 形象 |
@@ -173,7 +206,7 @@ python server.py
 |------|-----------|-----------|
 | **技术栈** | Python + PyTorch | JavaScript + Three.js |
 | **输入** | 单张照片 | Ready Player Me 3D Avatar |
-| **面部** | Wav2Lip（嘴型）+ LivePortrait（表情/头部） | Web Audio → jawOpen blendshape |
+| **面部** | SadTalker（表情/头动）+ Wav2Lip（嘴型）+ GFPGAN（修复） | Web Audio → jawOpen blendshape |
 | **身体** | ❌ 不支持 | ✅ Mixamo 全身动作（跳舞等） |
 | **输出** | 2D 视频 MP4 | 浏览器实时渲染 / 录屏 |
 | **硬件要求** | 可纯 CPU | 浏览器 WebGL 即可 |
@@ -218,10 +251,11 @@ iPhone Live Link Face (表情+头部)     NVIDIA Audio2Face (口型 viseme)
 
 ## ⚠️ 注意事项
 
-- 预训练模型文件较大（LivePortrait ~628MB, Wav2Lip ~872MB），首次运行前需下载
+- 预训练模型文件较大（LivePortrait ~628MB、Wav2Lip ~872MB、SadTalker 256/512 各 ~692MB、GFPGAN ~520MB），首次运行前需下载
 - 模型文件已通过 `.gitignore` 排除，新机器上首次运行时再下载
 - 国内用户访问 HuggingFace 建议设置 `HF_ENDPOINT=https://hf-mirror.com`
-- LivePortrait 和 Wav2Lip 各自保留原始 `.git` 目录便于单独追踪上游更新
+- LivePortrait、Wav2Lip、SadTalker 各自保留原始 `.git` 目录便于单独追踪上游更新（源码同时纳入主仓库，模型除外）
+- conda 环境的 ffmpeg 存在 DLL 冲突（`找不到 libintl_dgettext`），流水线自动优先使用 `ffmpeg/ffmpeg.exe` 本地静态版
 
 ## 📝 License
 
