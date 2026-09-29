@@ -154,7 +154,10 @@ python digital_human_pipeline.py --photo your_photo.jpg --text "你好" --no-sad
 # 其他常用开关
 #   --sadtalker-size 256     SadTalker 用 256 渲染（更快，略不像本人）
 #   --sadtalker-still        减少头部摆动（稳重口播风）
+#   --expression-scale 1.3   表情幅度（调大改善表情僵硬，过大易变形）
+#   --pose-style 12          头部姿态风格 0~45（头完全不动时换值试试）
 #   --no-gfpgan              关闭人脸修复
+#   --gfpgan-weight 0.7      修复力度（调大嘴部更清晰，略偏相貌）
 #   --no-interpolation       关闭 50fps 插帧
 #   --keep-intermediate      保留 SadTalker 中间视频（默认成功后删除）
 

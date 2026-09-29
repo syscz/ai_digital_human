@@ -246,6 +246,7 @@ def generate_expressive_video(
     output_path: str,
     still: bool = False,
     expression_scale: float = 1.0,
+    pose_style: int = 0,
     render_size: int = 512,
 ) -> str:
     """
@@ -259,7 +260,10 @@ def generate_expressive_video(
         audio_path: 驱动音频（wav）
         output_path: 输出视频路径（mp4）
         still: True 时大幅减少头部摆动（更稳但略生硬）
-        expression_scale: 表情幅度，1.0 为默认
+        expression_scale: 表情幅度，1.0 为默认；调大（如 1.3）可改善表情僵硬，
+            过大容易五官变形
+        pose_style: 头部姿态风格 0~45（SadTalker --pose_style），0 为默认；
+            不同值对应不同的基础头姿/头动习惯，头完全不动时换几个值试试
         render_size: 内部渲染分辨率 256 或 512；512 更贴近本人相貌、
             面部细节更好，但 CPU 渲染耗时约为 256 的 3-4 倍
             （需要 checkpoints/SadTalker_V0.0.2_512.safetensors）
@@ -293,6 +297,7 @@ def generate_expressive_video(
         "--preprocess", "full",   # 保留原图构图（身体/背景），适合半身照
         "--size", str(render_size),
         "--expression_scale", str(expression_scale),
+        "--pose_style", str(pose_style),
         "--cpu",
     ]
     if still:
@@ -527,6 +532,8 @@ async def run_pipeline(
     enable_sadtalker: bool = True,
     sadtalker_still: bool = False,
     sadtalker_size: int = 512,
+    sadtalker_expression_scale: float = 1.0,
+    sadtalker_pose_style: int = 0,
     enable_gfpgan: bool = True,
     gfpgan_weight: float = 0.5,
     enable_interpolation: bool = True,
@@ -548,6 +555,8 @@ async def run_pipeline(
         enable_sadtalker: 是否启用 SadTalker 表情/头动（让视频自然）
         sadtalker_still: SadTalker 是否减少头部摆动
         sadtalker_size: SadTalker 渲染分辨率 256/512（512 更像本人但更慢）
+        sadtalker_expression_scale: 表情幅度（默认 1.0，调大如 1.3 改善表情僵硬）
+        sadtalker_pose_style: 头部姿态风格 0~45（默认 0，头不动时换值试试）
         enable_gfpgan: 是否用 GFPGAN 做人脸修复（解决嘴部模糊）
         gfpgan_weight: GFPGAN 修复力度 0~1（越小越保留本人相貌）
         enable_interpolation: 是否在头动链路末尾插帧到 50fps（更顺滑）
@@ -592,6 +601,8 @@ async def run_pipeline(
             generate_expressive_video(
                 photo_path, audio_path, sad_path,
                 still=sadtalker_still, render_size=sadtalker_size,
+                expression_scale=sadtalker_expression_scale,
+                pose_style=sadtalker_pose_style,
             )
             # Step 2b: Wav2Lip 以表情视频为底，精修嘴型（视频输入，跟随头动）
             audio_to_video(
@@ -655,6 +666,10 @@ def main_cli():
                         help="SadTalker 减少头部摆动（更稳但自然度略降）")
     parser.add_argument("--sadtalker-size", type=int, default=512, choices=[256, 512],
                         help="SadTalker 渲染分辨率（默认 512，更像本人；256 更快）")
+    parser.add_argument("--expression-scale", type=float, default=1.0,
+                        help="SadTalker 表情幅度（默认 1.0；调大如 1.3 改善表情僵硬，过大易变形）")
+    parser.add_argument("--pose-style", type=int, default=0,
+                        help="SadTalker 头部姿态风格 0~45（默认 0；头完全不动时换几个值试试）")
     parser.add_argument("--no-interpolation", action="store_true",
                         help="关闭 50fps 运动插帧（默认开启，仅在 SadTalker 链路生效）")
     parser.add_argument("--keep-intermediate", action="store_true",
@@ -685,6 +700,8 @@ def main_cli():
         enable_sadtalker=not args.no_sadtalker,
         sadtalker_still=args.sadtalker_still,
         sadtalker_size=args.sadtalker_size,
+        sadtalker_expression_scale=args.expression_scale,
+        sadtalker_pose_style=args.pose_style,
         enable_gfpgan=not args.no_gfpgan,
         gfpgan_weight=args.gfpgan_weight,
         enable_interpolation=not args.no_interpolation,
@@ -724,6 +741,18 @@ def launch_gradio():
                     label="减少头部摆动（更稳重的口播效果）",
                     interactive=True,
                 )
+                expression_scale = gr.Slider(
+                    minimum=0.5, maximum=2.0, value=1.0, step=0.1,
+                    label="🎭 表情幅度（SadTalker expression_scale）",
+                    info="调大可改善表情僵硬（1.2~1.5 试试），过大容易五官变形",
+                    interactive=True,
+                )
+                pose_style = gr.Slider(
+                    minimum=0, maximum=45, value=0, step=1,
+                    label="🧭 头部姿态风格（SadTalker pose_style）",
+                    info="不同值对应不同的基础头姿/头动习惯，头完全不动时换几个值试试",
+                    interactive=True,
+                )
                 enable_interpolation = gr.Checkbox(
                     value=True,
                     label="🎞️ 50fps 运动插帧（动作更顺滑）",
@@ -735,7 +764,7 @@ def launch_gradio():
                 output_video = gr.Video(label="🎥 生成的说话视频")
 
         def process(image, text, voice_label, enable_sadtalker, sadtalker_still,
-                    enable_interpolation):
+                    expression_scale, pose_style, enable_interpolation):
             """Gradio 处理函数"""
             # Gradio 4.x 里 Image(type="pil") 返回 PIL.Image，需要转成临时文件
             photo_path = image if isinstance(image, str) else None
@@ -758,6 +787,8 @@ def launch_gradio():
                     output_dir=str(PROJECT_ROOT / "output"),
                     enable_sadtalker=enable_sadtalker,
                     sadtalker_still=sadtalker_still,
+                    sadtalker_expression_scale=float(expression_scale),
+                    sadtalker_pose_style=int(pose_style),
                     enable_interpolation=enable_interpolation,
                 ))
                 return result["video"]
@@ -772,18 +803,23 @@ def launch_gradio():
         btn.click(
             fn=process,
             inputs=[photo, text, voice, enable_sadtalker, sadtalker_still,
-                    enable_interpolation],
+                    expression_scale, pose_style, enable_interpolation],
             outputs=output_video,
         )
 
-        # SadTalker 关闭时，"减少头部摆动"和"50fps 插帧"都没有意义 → 自动禁用
+        # SadTalker 关闭时，"减少头部摆动"/"表情幅度"/"头部姿态"/"50fps 插帧"都没有意义 → 自动禁用
         def _toggle_sadtalker_options(enabled):
-            return gr.update(interactive=enabled), gr.update(interactive=enabled)
+            return (
+                gr.update(interactive=enabled),
+                gr.update(interactive=enabled),
+                gr.update(interactive=enabled),
+                gr.update(interactive=enabled),
+            )
 
         enable_sadtalker.change(
             fn=_toggle_sadtalker_options,
             inputs=enable_sadtalker,
-            outputs=[sadtalker_still, enable_interpolation],
+            outputs=[sadtalker_still, expression_scale, pose_style, enable_interpolation],
         )
 
         gr.Markdown("""
