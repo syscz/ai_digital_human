@@ -46,6 +46,9 @@ ffmpeg/
 gfpgan_weights/
 gfpgan/
 
+# ===== 阶段结果缓存 =====
+cache/
+
 # ===== SadTalker（含模型/产物，嵌套 .git 不纳入主仓库） =====
 SadTalker/.git/
 SadTalker/checkpoints/

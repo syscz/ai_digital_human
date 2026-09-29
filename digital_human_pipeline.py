@@ -42,6 +42,7 @@ SADTALKER_DIR = PROJECT_ROOT / "SadTalker"
 SADTALKER_INFERENCE = SADTALKER_DIR / "inference.py"
 GFPGAN_WEIGHTS = PROJECT_ROOT / "gfpgan_weights" / "GFPGANv1.4.pth"
 CONDA_ENV = "LivePortrait"
+CACHE_DIR = PROJECT_ROOT / "cache"  # 阶段结果缓存（内容寻址，见 _cache_path）
 
 # 常用中文语音
 CHINESE_VOICES = {
@@ -522,6 +523,25 @@ def enhance_video(
     return video_path
 
 
+# ========== 阶段结果缓存（内容寻址，加速调参复跑） ==========
+def _file_sha1(path: str, chunk_size: int = 1 << 20) -> str:
+    """文件内容 sha1（流式读取；音频/视频/图片均为 MB 级，耗时可忽略）"""
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cache_path(stage: str, ext: str, key_parts: list) -> Path:
+    """按 key 生成 cache/<stage>/<摘要>.<ext> 路径；key 中文件请传内容 sha1 而非路径"""
+    import hashlib
+    raw = "\x00".join(str(p) for p in key_parts).encode("utf-8")
+    digest = hashlib.sha1(raw).hexdigest()[:16]
+    return CACHE_DIR / stage / f"{digest}.{ext}"
+
+
 # ========== 主流水线 ==========
 async def run_pipeline(
     photo_path: str,
@@ -538,6 +558,7 @@ async def run_pipeline(
     gfpgan_weight: float = 0.5,
     enable_interpolation: bool = True,
     keep_intermediate: bool = False,
+    use_cache: bool = True,
 ) -> dict:
     """
     端到端流水线：文本 + 照片 → 说话视频
@@ -562,6 +583,10 @@ async def run_pipeline(
         enable_interpolation: 是否在头动链路末尾插帧到 50fps（更顺滑）
         keep_intermediate: 保留 SadTalker 中间视频（expressive_*.mp4）；
             默认流水线成功后删除，失败时始终保留以便排查
+        use_cache: 启用阶段结果缓存（cache/ 目录，内容寻址）。TTS 按 文本+语音，
+            SadTalker 按 音频+照片+表情参数，Wav2Lip 按 输入视频+音频+模型；
+            调参复跑命中即跳过对应阶段。GFPGAN/插帧是最常调的下游参数，不缓存。
+            CLI 用 --no-cache 关闭，删 cache/ 目录即清空
 
     Returns:
         dict: {"audio": "xxx.wav", "video": "xxx.mp4"}
@@ -575,6 +600,8 @@ async def run_pipeline(
 
     # 确保 ffmpeg 优先用本地静态版（Gradio 模式不经过 check_prerequisites）
     ensure_ffmpeg_in_path()
+
+    wav2lip_ckpt = wav2lip_checkpoint or str(WAV2LIP_CHECKPOINT)
 
     # 用时间戳避免文件名冲突
     import time
@@ -591,30 +618,60 @@ async def run_pipeline(
     print("=" * 60 + "\n")
 
     try:
-        # Step 1: 语音合成
-        await text_to_speech(text, voice, audio_path)
+        # Step 1: 语音合成（按 文本+语音 缓存，调参复跑直接命中）
+        tts_cache = _cache_path("tts", "wav", [voice, text.strip()])
+        if use_cache and tts_cache.exists():
+            shutil.copyfile(tts_cache, audio_path)
+            print("🎯  TTS 缓存命中，跳过语音合成")
+        else:
+            await text_to_speech(text, voice, audio_path)
+            tts_cache.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(audio_path, tts_cache)
 
         sad_path = None
+        static_input = not enable_sadtalker  # 静态图链路：照片直接驱动，只有嘴动
         if enable_sadtalker:
             # Step 2a: SadTalker 生成带表情/头动的视频（嘴型不准）
             sad_path = str(output_dir / f"expressive_{timestamp}.mp4")
-            generate_expressive_video(
-                photo_path, audio_path, sad_path,
-                still=sadtalker_still, render_size=sadtalker_size,
-                expression_scale=sadtalker_expression_scale,
-                pose_style=sadtalker_pose_style,
-            )
-            # Step 2b: Wav2Lip 以表情视频为底，精修嘴型（视频输入，跟随头动）
-            audio_to_video(
-                sad_path, audio_path, video_path, wav2lip_checkpoint,
-                static_input=False,
-            )
+            # 缓存键：音频+照片+全部 SadTalker 参数，任一变化即重新生成
+            sad_cache = _cache_path("sadtalker", "mp4", [
+                _file_sha1(audio_path), _file_sha1(photo_path),
+                sadtalker_expression_scale, sadtalker_pose_style,
+                sadtalker_still, sadtalker_size,
+            ])
+            if use_cache and sad_cache.exists():
+                shutil.copyfile(sad_cache, sad_path)
+                print("🎯  SadTalker 缓存命中，跳过表情/头动生成")
+            else:
+                generate_expressive_video(
+                    photo_path, audio_path, sad_path,
+                    still=sadtalker_still, render_size=sadtalker_size,
+                    expression_scale=sadtalker_expression_scale,
+                    pose_style=sadtalker_pose_style,
+                )
+                sad_cache.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(sad_path, sad_cache)
+            face_input = sad_path
         else:
-            # 退化链路：照片直接驱动，只有嘴动
+            face_input = photo_path
+
+        # Step 2b: Wav2Lip 精修嘴型（视频输入跟随头动 / 静态图只用第一帧）
+        # 缓存键：输入画面+音频+模型；下游 GFPGAN/插帧参数常调，刻意不缓存
+        wav2lip_cache = _cache_path("wav2lip", "mp4", [
+            _file_sha1(face_input), _file_sha1(audio_path),
+            Path(wav2lip_ckpt).name, Path(wav2lip_ckpt).stat().st_size,
+            "static" if static_input else "video",
+        ])
+        if use_cache and wav2lip_cache.exists():
+            shutil.copyfile(wav2lip_cache, video_path)
+            print("🎯  Wav2Lip 缓存命中，跳过嘴型精修")
+        else:
             audio_to_video(
-                photo_path, audio_path, video_path, wav2lip_checkpoint,
-                static_input=True,
+                face_input, audio_path, video_path, wav2lip_ckpt,
+                static_input=static_input,
             )
+            wav2lip_cache.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(video_path, wav2lip_cache)
 
         # Step 3: 人脸修复（可选，改善嘴部模糊）
         if enable_gfpgan:
@@ -674,6 +731,8 @@ def main_cli():
                         help="关闭 50fps 运动插帧（默认开启，仅在 SadTalker 链路生效）")
     parser.add_argument("--keep-intermediate", action="store_true",
                         help="保留 SadTalker 中间视频 expressive_*.mp4（默认成功后删除）")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="禁用阶段结果缓存（默认开启：TTS/SadTalker/Wav2Lip 按 输入+参数 命中即跳过；删 cache/ 目录即清空）")
     parser.add_argument("--gfpgan-weight", type=float, default=0.5,
                         help="GFPGAN 修复力度 0~1（默认 0.5，越小越保留本人相貌）")
     parser.add_argument("--gradio", action="store_true", help="启动 Gradio 界面")
@@ -706,6 +765,7 @@ def main_cli():
         gfpgan_weight=args.gfpgan_weight,
         enable_interpolation=not args.no_interpolation,
         keep_intermediate=args.keep_intermediate,
+        use_cache=not args.no_cache,
     ))
 
     print(f"\n🎬 生成的视频: {result['video']}")

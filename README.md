@@ -160,6 +160,7 @@ python digital_human_pipeline.py --photo your_photo.jpg --text "你好" --no-sad
 #   --gfpgan-weight 0.7      修复力度（调大嘴部更清晰，略偏相貌）
 #   --no-interpolation       关闭 50fps 插帧
 #   --keep-intermediate      保留 SadTalker 中间视频（默认成功后删除）
+#   --no-cache               禁用阶段结果缓存（默认开启：相同 文本/照片/参数 命中即跳过，调参复跑快）
 
 # Gradio 界面
 python digital_human_pipeline.py --gradio
