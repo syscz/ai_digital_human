@@ -25,13 +25,18 @@ class Preprocesser:
         :return: np.array shape=(68, 2)
         """
         with torch.no_grad():
-            dets = self.predictor.det_net.detect_faces(img_np, 0.97)
+            # 上游 preprocess.py 传入 RGB，但本类两个模型都按 BGR 处理：
+            # RetinaFace 按 BGR 训练（RGB 输入置信度骤降，低头/侧脸照片在
+            # 0.97 阈值下直接检不到），FAN 内部 img[..., ::-1] 也自行转 RGB。
+            # 因此先转回 BGR 再检测/提取关键点
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            dets = self.predictor.det_net.detect_faces(img_bgr, 0.97)
 
         if len(dets) == 0:
             return None
         det = dets[0]
 
-        img = img_np[int(det[1]):int(det[3]), int(det[0]):int(det[2]), :]
+        img = img_bgr[int(det[1]):int(det[3]), int(det[0]):int(det[2]), :]
         lm = landmark_98_to_68(self.predictor.detector.get_landmarks(img)) # [0]
 
         #### keypoints to the original location
@@ -128,7 +133,7 @@ class Preprocesser:
         lm = self.get_landmark(img_np)
 
         if lm is None:
-            raise 'can not detect the landmark from source image'
+            raise ValueError('can not detect the landmark from source image')
         rsize, crop, quad = self.align_face(img=Image.fromarray(img_np), lm=lm, output_size=xsize)
         clx, cly, crx, cry = crop
         lx, ly, rx, ry = quad
