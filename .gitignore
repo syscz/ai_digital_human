@@ -49,6 +49,9 @@ gfpgan/
 # ===== 阶段结果缓存 =====
 cache/
 
+# ===== 个人测试照片 =====
+/test_selfie.jpg
+
 # ===== SadTalker（含模型/产物，嵌套 .git 不纳入主仓库） =====
 SadTalker/.git/
 SadTalker/checkpoints/

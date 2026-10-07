@@ -129,7 +129,20 @@ def check_prerequisites():
     return True
 
 
-# ========== Step 1: Edge-TTS 语音合成 ==========
+# ========== Step 1: 语音合成 ==========
+def _to_wav16k(src: str, dst: str):
+    """用本地静态 ffmpeg 把任意音频转成 16kHz mono PCM wav（下游统一格式）"""
+    ffmpeg_cmd = [
+        get_ffmpeg_exe(), "-y",
+        "-i", src,
+        "-ar", "16000",       # 采样率 16kHz
+        "-ac", "1",           # 单声道
+        "-c:a", "pcm_s16le",  # 16-bit PCM
+        dst,
+    ]
+    subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
+
+
 async def text_to_speech(text: str, voice: str, output_wav: str) -> str:
     """
     用 Edge-TTS 把文本合成为语音（WAV 格式）
@@ -153,15 +166,7 @@ async def text_to_speech(text: str, voice: str, output_wav: str) -> str:
 
     # Edge-TTS 默认输出 webm/mp3，需要转 wav（16kHz mono，Wav2Lip 需要）
     wav_16k = output_wav.replace(".wav", "_16k.wav")
-    ffmpeg_cmd = [
-        get_ffmpeg_exe(), "-y",
-        "-i", output_wav,
-        "-ar", "16000",  # 采样率 16kHz
-        "-ac", "1",      # 单声道
-        "-c:a", "pcm_s16le",  # 16-bit PCM
-        wav_16k,
-    ]
-    subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
+    _to_wav16k(output_wav, wav_16k)
 
     # 替换原文件
     shutil.move(wav_16k, output_wav)
@@ -542,6 +547,204 @@ def _cache_path(stage: str, ext: str, key_parts: list) -> Path:
     return CACHE_DIR / stage / f"{digest}.{ext}"
 
 
+# ========== 云端 API 后端（视频：阿里云百炼 LivePortrait；语音：MiniMax TTS） ==========
+# 密钥从环境变量读取：DASHSCOPE_API_KEY（北京地域）、MINIMAX_API_KEY、MINIMAX_GROUP_ID
+# 价格参考：liveportrait 视频 0.02 元/秒（1800 秒免费额度）+ 人脸检测 0.004 元/张
+def _require_env(name: str, hint: str) -> str:
+    val = os.environ.get(name, "")
+    if not val:
+        raise RuntimeError(f"缺少环境变量 {name}。{hint}")
+    return val
+
+
+def _upload_to_dashscope(path: str) -> str:
+    """把本地文件上传到 DashScope 临时存储，返回可直接用于 image_url/audio_url 的链接。
+
+    官方《文件上传》API：multipart POST /api/v1/uploads，
+    带 X-DashScope-OssResourceResolve: enable 时返回可直接引用的 URL（约 24h 有效）。
+    """
+    import requests
+    key = _require_env(
+        "DASHSCOPE_API_KEY",
+        "请开通阿里云百炼并创建北京地域 API Key：export DASHSCOPE_API_KEY=sk-xxx",
+    )
+    url = f"https://dashscope.aliyuncs.com/api/v1/uploads"
+    with open(path, "rb") as f:
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}",
+                     "X-DashScope-OssResourceResolve": "enable"},
+            files={"file": (os.path.basename(path), f)},
+            data={"purpose": "file-extract"},
+            timeout=120,
+        )
+    r.raise_for_status()
+    out = r.json().get("output", {})
+    file_url = out.get("url") or out.get("file_url")
+    if not file_url:
+        raise RuntimeError(f"DashScope 上传返回无法解析（请把以下信息反馈以适配）：{r.text[:300]}")
+    return file_url
+
+
+def _aliyun_face_detect(image_url: str) -> str:
+    """同步人脸合规检测；不通过时抛出带原因的异常"""
+    import requests
+    key = _require_env("DASHSCOPE_API_KEY", "北京地域百炼 API Key")
+    r = requests.post(
+        "https://dashscope.aliyuncs.com/api/v1/services/aigc/image2video/face-detect",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"model": "liveportrait-detect", "input": {"image_url": image_url}},
+        timeout=60,
+    )
+    r.raise_for_status()
+    out = r.json().get("output", {})
+    if not out.get("pass"):
+        raise RuntimeError(f"照片未通过 LivePortrait 人脸检测：{out.get('message')}")
+    return out.get("message", "pass")
+
+
+def generate_video_aliyun(
+    photo_path: str,
+    audio_path: str,
+    output_path: str,
+    template_id: str = "calm",
+    mouth_move_strength: float = 1.0,
+    head_move_strength: float = 0.7,
+    eye_move_freq: float = 0.5,
+    video_fps: int = 25,
+    poll_timeout: int = 900,
+) -> str:
+    """云端生成说话视频：照片+音频 → 口播视频（阿里云百炼 LivePortrait）。
+
+    替代本地 SadTalker+Wav2Lip+GFPGAN+插帧 全部环节，本机零负载。
+    photo/audio 传 http(s) 链接则直接使用，本地路径会自动上传到临时存储。
+    计费约 0.02 元/秒视频（有免费额度），异步任务一般 1-5 分钟完成。
+    """
+    import time
+    import requests
+    import wave
+
+    key = _require_env(
+        "DASHSCOPE_API_KEY",
+        "请开通阿里云百炼（华北2北京）并 export DASHSCOPE_API_KEY=sk-xxx",
+    )
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+    # 本地文件先上传；已是 http(s) 链接则直接用
+    image_url = photo_path if photo_path.startswith("http") else _upload_to_dashscope(photo_path)
+    audio_url = audio_path if audio_path.startswith("http") else _upload_to_dashscope(audio_path)
+
+    print("🔍  云端人脸检测...")
+    _aliyun_face_detect(image_url)
+
+    # 预估费用提示（0.02 元/秒）
+    with wave.open(audio_path, "rb") as w:
+        dur = w.getnframes() / w.getframerate()
+    print(f"📤  提交云端生成任务（音频 {dur:.1f}s，预计约 {dur*0.02+0.004:.2f} 元，一般 1-5 分钟）...")
+
+    submit_url = ("https://dashscope.aliyuncs.com/api/v1/services/aigc/image2video/video-synthesis")
+    body = {
+        "model": "liveportrait",
+        "input": {"image_url": image_url, "audio_url": audio_url},
+        "parameters": {
+            "template_id": template_id,          # normal/活泼 calm/播报 active/演唱
+            "mouth_move_strength": mouth_move_strength,
+            "head_move_strength": head_move_strength,
+            "eye_move_freq": eye_move_freq,
+            "video_fps": video_fps,
+            "paste_back": True,
+        },
+    }
+    r = requests.post(submit_url, headers={**headers, "X-DashScope-Async": "enable"},
+                      json=body, timeout=60)
+    r.raise_for_status()
+    j = r.json()
+    task_id = (j.get("output") or {}).get("task_id")
+    if not task_id:
+        raise RuntimeError(f"云端任务提交失败：{r.text[:300]}")
+    print(f"   任务ID: {task_id}")
+
+    query_url = f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        time.sleep(6)
+        q = requests.get(query_url, headers=headers, timeout=30)
+        q.raise_for_status()
+        out = q.json().get("output", {})
+        status = out.get("task_status")
+        if status == "SUCCEEDED":
+            video_url = (out.get("results") or {}).get("video_url")
+            if not video_url:
+                raise RuntimeError(f"云端任务成功但没有视频链接：{q.text[:300]}")
+            break
+        if status in ("FAILED", "UNKNOWN"):
+            raise RuntimeError(f"云端任务失败：{q.text[:300]}")
+        print(f"   状态: {status} ...")
+    else:
+        raise RuntimeError(f"云端任务超时（>{poll_timeout}s），可稍后用 task_id={task_id} 手动查询")
+
+    print("⬇️  下载视频...")
+    vd = requests.get(video_url, timeout=300)
+    vd.raise_for_status()
+    with open(output_path, "wb") as f:
+        f.write(vd.content)
+
+    size = os.path.getsize(output_path) / 1024 / 1024
+    print(f"   ✅ 云端视频生成: {output_path} ({size:.1f} MB)")
+    return output_path
+
+
+# MiniMax 语音合成（T2A v2）：中文情感自然度明显高于 Edge-TTS，支持音色克隆
+# 密钥：export MINIMAX_API_KEY=eyJ...  MINIMAX_GROUP_ID=xxxxx（均在开放平台账户管理页）
+MINIMAX_VOICES = {
+    "女声-亲切": "female-shaonv",
+    "女声-温柔": "female-yujie",
+    "男声-新闻": "male-qn-qingse",
+    "男声-年轻": "male-qn-jingying",
+    "男声-稳重": "presenter_male",
+}
+
+
+def text_to_speech_minimax(text: str, voice: str, output_wav: str) -> str:
+    """MiniMax T2A v2 语音合成。voice 传 MINIMAX_VOICES 里的标签或直接传 voice_id。"""
+    import requests
+
+    key = _require_env("MINIMAX_API_KEY", "export MINIMAX_API_KEY=eyJ...（MiniMax 开放平台）")
+    group_id = _require_env("MINIMAX_GROUP_ID", "export MINIMAX_GROUP_ID=xxx（账户管理页可查）")
+    base = os.environ.get("MINIMAX_API_BASE", "https://api.minimaxi.com")
+    voice_id = MINIMAX_VOICES.get(voice, voice)
+
+    print(f"🎙️  MiniMax 语音合成（{voice_id}）...")
+    r = requests.post(
+        f"{base}/v1/t2a_v2",
+        params={"GroupId": group_id},
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={
+            "model": "speech-02-hd",
+            "text": text,
+            "voice_setting": {"voice_id": voice_id, "speed": 1.0, "vol": 1.0, "pitch": 0},
+            "audio_setting": {"sample_rate": 32000, "format": "wav"},
+        },
+        timeout=120,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("base_resp", {}).get("status_code", 0) != 0:
+        raise RuntimeError(f"MiniMax TTS 失败：{j.get('base_resp')}")
+    audio_hex = (j.get("data") or {}).get("audio")
+    if not audio_hex:
+        raise RuntimeError(f"MiniMax TTS 未返回音频：{str(j)[:300]}")
+    tmp_wav = output_wav.replace(".wav", "_mm.wav")
+    with open(tmp_wav, "wb") as f:
+        f.write(bytes.fromhex(audio_hex))
+    _to_wav16k(tmp_wav, output_wav)
+    os.remove(tmp_wav)
+
+    size = os.path.getsize(output_wav) / 1024
+    print(f"   ✅ 语音生成: {output_wav} ({size:.0f} KB)")
+    return output_wav
+
+
 # ========== 主流水线 ==========
 async def run_pipeline(
     photo_path: str,
@@ -559,6 +762,10 @@ async def run_pipeline(
     enable_interpolation: bool = True,
     keep_intermediate: bool = False,
     use_cache: bool = True,
+    tts_backend: str = "edge",
+    video_backend: str = "local",
+    api_template_id: str = "calm",
+    api_mouth_strength: float = 1.0,
 ) -> dict:
     """
     端到端流水线：文本 + 照片 → 说话视频
@@ -587,6 +794,14 @@ async def run_pipeline(
             SadTalker 按 音频+照片+表情参数，Wav2Lip 按 输入视频+音频+模型；
             调参复跑命中即跳过对应阶段。GFPGAN/插帧是最常调的下游参数，不缓存。
             CLI 用 --no-cache 关闭，删 cache/ 目录即清空
+        tts_backend: 语音合成后端。"edge"=Edge-TTS 免费；"minimax"=MiniMax TTS
+            （需 MINIMAX_API_KEY/MINIMAX_GROUP_ID 环境变量，音色更自然）
+        video_backend: 视频生成后端。"local"=本机 SadTalker+Wav2Lip+GFPGAN
+            （免费但慢、CPU 满载）；"aliyun"=阿里云百炼 LivePortrait API
+            （需 DASHSCOPE_API_KEY，约 0.02 元/秒，画质更好且本机零负载，
+            自动跳过 GFPGAN/插帧）
+        api_template_id: 云端动作模板 normal/calm(播报)/active(演唱)
+        api_mouth_strength: 云端嘴部幅度 0~1.5（调大改善嘴型不明显）
 
     Returns:
         dict: {"audio": "xxx.wav", "video": "xxx.mp4"}
@@ -597,6 +812,10 @@ async def run_pipeline(
     else:
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 照片规范化为绝对路径：SadTalker/Wav2Lip 子进程会切换 CWD 到各自目录，
+    # 相对路径在子进程里解析不到（此前只用 Gradio/绝对路径没暴露）
+    photo_path = str(Path(photo_path).resolve())
 
     # 确保 ffmpeg 优先用本地静态版（Gradio 模式不经过 check_prerequisites）
     ensure_ffmpeg_in_path()
@@ -618,63 +837,87 @@ async def run_pipeline(
     print("=" * 60 + "\n")
 
     try:
-        # Step 1: 语音合成（按 文本+语音 缓存，调参复跑直接命中）
-        tts_cache = _cache_path("tts", "wav", [voice, text.strip()])
+        # Step 1: 语音合成（按 后端+文本+语音 缓存，调参复跑直接命中）
+        tts_cache = _cache_path("tts", "wav", [tts_backend, voice, text.strip()])
         if use_cache and tts_cache.exists():
             shutil.copyfile(tts_cache, audio_path)
             print("🎯  TTS 缓存命中，跳过语音合成")
         else:
-            await text_to_speech(text, voice, audio_path)
+            if tts_backend == "minimax":
+                text_to_speech_minimax(text, voice, audio_path)
+            else:
+                await text_to_speech(text, voice, audio_path)
             tts_cache.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(audio_path, tts_cache)
 
         sad_path = None
         static_input = not enable_sadtalker  # 静态图链路：照片直接驱动，只有嘴动
-        if enable_sadtalker:
-            # Step 2a: SadTalker 生成带表情/头动的视频（嘴型不准）
-            sad_path = str(output_dir / f"expressive_{timestamp}.mp4")
-            # 缓存键：音频+照片+全部 SadTalker 参数，任一变化即重新生成
-            sad_cache = _cache_path("sadtalker", "mp4", [
-                _file_sha1(audio_path), _file_sha1(photo_path),
-                sadtalker_expression_scale, sadtalker_pose_style,
-                sadtalker_still, sadtalker_size,
+
+        if video_backend == "aliyun":
+            # 云端后端：照片+音频 一次调用，本机 SadTalker/Wav2Lip/GFPGAN 全部跳过
+            api_cache = _cache_path("liveportrait", "mp4", [
+                _file_sha1(photo_path), _file_sha1(audio_path),
+                api_template_id, api_mouth_strength,
             ])
-            if use_cache and sad_cache.exists():
-                shutil.copyfile(sad_cache, sad_path)
-                print("🎯  SadTalker 缓存命中，跳过表情/头动生成")
+            if use_cache and api_cache.exists():
+                shutil.copyfile(api_cache, video_path)
+                print("🎯  LivePortrait API 缓存命中，跳过云端调用（省钱）")
             else:
-                generate_expressive_video(
-                    photo_path, audio_path, sad_path,
-                    still=sadtalker_still, render_size=sadtalker_size,
-                    expression_scale=sadtalker_expression_scale,
-                    pose_style=sadtalker_pose_style,
+                generate_video_aliyun(
+                    photo_path, audio_path, video_path,
+                    template_id=api_template_id,
+                    mouth_move_strength=api_mouth_strength,
                 )
-                sad_cache.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(sad_path, sad_cache)
-            face_input = sad_path
+                api_cache.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(video_path, api_cache)
+            if enable_gfpgan or enable_interpolation:
+                print("   ℹ️  云端后端画质自带修复，已跳过本地 GFPGAN/插帧")
         else:
-            face_input = photo_path
+            if enable_sadtalker:
+                # Step 2a: SadTalker 生成带表情/头动的视频（嘴型不准）
+                sad_path = str(output_dir / f"expressive_{timestamp}.mp4")
+                # 缓存键：音频+照片+全部 SadTalker 参数，任一变化即重新生成
+                sad_cache = _cache_path("sadtalker", "mp4", [
+                    _file_sha1(audio_path), _file_sha1(photo_path),
+                    sadtalker_expression_scale, sadtalker_pose_style,
+                    sadtalker_still, sadtalker_size,
+                ])
+                if use_cache and sad_cache.exists():
+                    shutil.copyfile(sad_cache, sad_path)
+                    print("🎯  SadTalker 缓存命中，跳过表情/头动生成")
+                else:
+                    generate_expressive_video(
+                        photo_path, audio_path, sad_path,
+                        still=sadtalker_still, render_size=sadtalker_size,
+                        expression_scale=sadtalker_expression_scale,
+                        pose_style=sadtalker_pose_style,
+                    )
+                    sad_cache.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(sad_path, sad_cache)
+                face_input = sad_path
+            else:
+                face_input = photo_path
 
-        # Step 2b: Wav2Lip 精修嘴型（视频输入跟随头动 / 静态图只用第一帧）
-        # 缓存键：输入画面+音频+模型；下游 GFPGAN/插帧参数常调，刻意不缓存
-        wav2lip_cache = _cache_path("wav2lip", "mp4", [
-            _file_sha1(face_input), _file_sha1(audio_path),
-            Path(wav2lip_ckpt).name, Path(wav2lip_ckpt).stat().st_size,
-            "static" if static_input else "video",
-        ])
-        if use_cache and wav2lip_cache.exists():
-            shutil.copyfile(wav2lip_cache, video_path)
-            print("🎯  Wav2Lip 缓存命中，跳过嘴型精修")
-        else:
-            audio_to_video(
-                face_input, audio_path, video_path, wav2lip_ckpt,
-                static_input=static_input,
-            )
-            wav2lip_cache.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(video_path, wav2lip_cache)
+            # Step 2b: Wav2Lip 精修嘴型（视频输入跟随头动 / 静态图只用第一帧）
+            # 缓存键：输入画面+音频+模型；下游 GFPGAN/插帧参数常调，刻意不缓存
+            wav2lip_cache = _cache_path("wav2lip", "mp4", [
+                _file_sha1(face_input), _file_sha1(audio_path),
+                Path(wav2lip_ckpt).name, Path(wav2lip_ckpt).stat().st_size,
+                "static" if static_input else "video",
+            ])
+            if use_cache and wav2lip_cache.exists():
+                shutil.copyfile(wav2lip_cache, video_path)
+                print("🎯  Wav2Lip 缓存命中，跳过嘴型精修")
+            else:
+                audio_to_video(
+                    face_input, audio_path, video_path, wav2lip_ckpt,
+                    static_input=static_input,
+                )
+                wav2lip_cache.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(video_path, wav2lip_cache)
 
-        # Step 3: 人脸修复（可选，改善嘴部模糊）
-        if enable_gfpgan:
+        # Step 3: 人脸修复（可选，改善嘴部模糊；云端后端不需要）
+        if enable_gfpgan and video_backend == "local":
             # 头动视频必须逐帧检测+平滑框；静态图链路才用固定框
             # 插帧只在头动链路开启（静态嘴动没有帧间运动可补）
             enhance_video(
@@ -733,6 +976,14 @@ def main_cli():
                         help="保留 SadTalker 中间视频 expressive_*.mp4（默认成功后删除）")
     parser.add_argument("--no-cache", action="store_true",
                         help="禁用阶段结果缓存（默认开启：TTS/SadTalker/Wav2Lip 按 输入+参数 命中即跳过；删 cache/ 目录即清空）")
+    parser.add_argument("--tts-backend", choices=["edge", "minimax"], default="edge",
+                        help="语音合成后端：edge=免费；minimax=MiniMax TTS（更自然，需 MINIMAX_API_KEY/MINIMAX_GROUP_ID 环境变量）")
+    parser.add_argument("--video-backend", choices=["local", "aliyun"], default="local",
+                        help="视频生成后端：local=本机推理（免费但 CPU 满载）；aliyun=百炼 LivePortrait API（约0.02元/秒，本机零负载，需 DASHSCOPE_API_KEY）")
+    parser.add_argument("--template-id", choices=["normal", "calm", "active"], default="calm",
+                        help="云端动作模板（仅 --video-backend aliyun）：calm=播报(默认) normal=常规 active=演唱")
+    parser.add_argument("--mouth-strength", type=float, default=1.0,
+                        help="云端嘴部幅度 0~1.5（仅 --video-backend aliyun，默认 1.0）")
     parser.add_argument("--gfpgan-weight", type=float, default=0.5,
                         help="GFPGAN 修复力度 0~1（默认 0.5，越小越保留本人相貌）")
     parser.add_argument("--gradio", action="store_true", help="启动 Gradio 界面")
@@ -747,7 +998,8 @@ def main_cli():
     if not args.photo or not args.text:
         parser.error("--photo 和 --text 是命令行模式下的必填参数（Gradio 模式用 --gradio 启动）")
 
-    if not check_prerequisites():
+    # 云端后端不需要本地模型/conda 检查
+    if args.video_backend != "aliyun" and not check_prerequisites():
         sys.exit(1)
 
     result = asyncio.run(run_pipeline(
@@ -766,6 +1018,10 @@ def main_cli():
         enable_interpolation=not args.no_interpolation,
         keep_intermediate=args.keep_intermediate,
         use_cache=not args.no_cache,
+        tts_backend=args.tts_backend,
+        video_backend=args.video_backend,
+        api_template_id=args.template_id,
+        api_mouth_strength=args.mouth_strength,
     ))
 
     print(f"\n🎬 生成的视频: {result['video']}")
@@ -820,11 +1076,34 @@ def launch_gradio():
                 )
                 btn = gr.Button("🚀 生成视频", variant="primary")
 
+                with gr.Accordion("⚙️ 后端与云端设置", open=False):
+                    tts_backend = gr.Radio(
+                        ["edge", "minimax"], value="edge",
+                        label="🎙️ 语音合成后端",
+                        info="edge=免费；minimax=更自然（需设置 MINIMAX_API_KEY/MINIMAX_GROUP_ID 环境变量）",
+                    )
+                    video_backend = gr.Radio(
+                        ["local", "aliyun"], value="local",
+                        label="🎬 视频生成后端",
+                        info="local=本机推理（免费但 CPU 满载，注意散热）；aliyun=百炼 LivePortrait（约0.02元/秒，需 DASHSCOPE_API_KEY，本机零负载）",
+                    )
+                    api_template = gr.Dropdown(
+                        ["calm", "normal", "active"], value="calm",
+                        label="云端动作模板（仅 aliyun）",
+                        info="calm=播报口吻 normal=常规 active=演唱",
+                    )
+                    api_mouth = gr.Slider(
+                        minimum=0, maximum=1.5, value=1.0, step=0.1,
+                        label="云端嘴部幅度（仅 aliyun）",
+                        info="嘴型不明显就调大",
+                    )
+
             with gr.Column():
                 output_video = gr.Video(label="🎥 生成的说话视频")
 
         def process(image, text, voice_label, enable_sadtalker, sadtalker_still,
-                    expression_scale, pose_style, enable_interpolation):
+                    expression_scale, pose_style, enable_interpolation,
+                    tts_backend, video_backend, api_template, api_mouth):
             """Gradio 处理函数"""
             # Gradio 4.x 里 Image(type="pil") 返回 PIL.Image，需要转成临时文件
             photo_path = image if isinstance(image, str) else None
@@ -850,6 +1129,10 @@ def launch_gradio():
                     sadtalker_expression_scale=float(expression_scale),
                     sadtalker_pose_style=int(pose_style),
                     enable_interpolation=enable_interpolation,
+                    tts_backend=tts_backend,
+                    video_backend=video_backend,
+                    api_template_id=api_template,
+                    api_mouth_strength=float(api_mouth),
                 ))
                 return result["video"]
             finally:
@@ -863,7 +1146,8 @@ def launch_gradio():
         btn.click(
             fn=process,
             inputs=[photo, text, voice, enable_sadtalker, sadtalker_still,
-                    expression_scale, pose_style, enable_interpolation],
+                    expression_scale, pose_style, enable_interpolation,
+                    tts_backend, video_backend, api_template, api_mouth],
             outputs=output_video,
         )
 

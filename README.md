@@ -145,8 +145,18 @@ python inference.py --checkpoint_path checkpoints/wav2lip.pth --face your_photo.
 conda activate LivePortrait
 cd d:\Work\Python\ai_digital_human
 
-# 命令行（完整链路：SadTalker 表情/头动 → Wav2Lip 精修嘴型 → GFPGAN 修复 → 50fps 插帧）
+# 本地链路（免费，CPU 推理；注意长时间满载对散热/电源要求高）
 python digital_human_pipeline.py --photo your_photo.jpg --text "你好，我是数字人" --voice zh-CN-XiaoxiaoNeural
+
+# 云端链路（推荐：约0.02元/秒，本机零负载，画质更好）
+# 前置：开通阿里云百炼（华北2北京），然后设置环境变量
+set DASHSCOPE_API_KEY=sk-xxx
+python digital_human_pipeline.py --photo your_photo.jpg --text "你好" --video-backend aliyun
+
+# 声音也换云端（MiniMax TTS，中文情感更自然）
+set MINIMAX_API_KEY=eyJ-xxx
+set MINIMAX_GROUP_ID=xxx
+python digital_human_pipeline.py --photo your_photo.jpg --text "你好" --tts-backend minimax --video-backend aliyun
 
 # 快速链路（--no-sadtalker：只有嘴动，CPU 上快约一个量级）
 python digital_human_pipeline.py --photo your_photo.jpg --text "你好" --no-sadtalker
@@ -156,9 +166,11 @@ python digital_human_pipeline.py --photo your_photo.jpg --text "你好" --no-sad
 #   --sadtalker-still        减少头部摆动（稳重口播风）
 #   --expression-scale 1.3   表情幅度（调大改善表情僵硬，过大易变形）
 #   --pose-style 12          头部姿态风格 0~45（头完全不动时换值试试）
-#   --no-gfpgan              关闭人脸修复
+#   --template-id calm       云端动作模板 normal/calm/active（仅 aliyun）
+#   --mouth-strength 1.2     云端嘴部幅度 0~1.5（仅 aliyun）
+#   --no-gfpgan              关闭人脸修复（仅本地链路）
 #   --gfpgan-weight 0.7      修复力度（调大嘴部更清晰，略偏相貌）
-#   --no-interpolation       关闭 50fps 插帧
+#   --no-interpolation       关闭 50fps 插帧（仅本地链路）
 #   --keep-intermediate      保留 SadTalker 中间视频（默认成功后删除）
 #   --no-cache               禁用阶段结果缓存（默认开启：相同 文本/照片/参数 命中即跳过，调参复跑快）
 
@@ -167,7 +179,7 @@ python digital_human_pipeline.py --gradio
 # 浏览器打开 http://localhost:7860
 ```
 
-> ⏱ CPU 性能参考（无 NVIDIA GPU）：完整链路一段 15 秒语音约十几分钟（SadTalker 512 + 逐帧 GFPGAN 是大头）；`--no-sadtalker` 快速链路约 1-3 分钟。
+> ⏱ CPU 性能参考（无 NVIDIA GPU）：本地完整链路一段 15 秒语音约十几分钟（SadTalker 512 + 逐帧 GFPGAN 是大头）；`--no-sadtalker` 快速链路约 1-3 分钟；`--video-backend aliyun` 本机零负载，云端排队 1-5 分钟。
 
 #### 方式 D：3D 全身数字人（浏览器实时渲染）
 
