@@ -181,7 +181,33 @@ python digital_human_pipeline.py --gradio
 
 > ⏱ CPU 性能参考（无 NVIDIA GPU）：本地完整链路一段 15 秒语音约十几分钟（SadTalker 512 + 逐帧 GFPGAN 是大头）；`--no-sadtalker` 快速链路约 1-3 分钟；`--video-backend aliyun` 本机零负载，云端排队 1-5 分钟。
 
-#### 方式 D：3D 全身数字人（浏览器实时渲染）
+#### 方式 D：唱跳视频流水线（H3 开源权重 + AutoDL 租卡，2026-10 新增）
+
+```powershell
+conda activate LivePortrait
+cd d:\Work\Python\ai_digital_human
+
+# 1) 分镜：主题 → 镜头脚本（Ollama 本地免费；--no-llm 用内置模板）
+python song_dance_pipeline.py storyboard --theme "银发赛博朋克女歌手的霓虹舞台表演" --project mymv
+#   可选：--lyrics 歌词.txt --segments 9
+
+# 2) 打包远程执行包（把歌曲/舞蹈参考视频/角色图一并打进去）
+python song_dance_pipeline.py pack --project mymv --song song.mp3
+#   可选：--dance-ref 舞蹈参考.mp4 --char-image 角色图.jpg（不传则按描述生成虚拟人物）
+
+# 3) 上传 remote_bundle.zip 到 AutoDL 4090 实例执行（步骤见包内 README_REMOTE.txt）
+#    约几十分钟，成本约 ¥1~2；取回 out/segments.zip 解压到 output/sd_projects/mymv/segments/
+
+# 4) 拼装成片（拼接+主音轨+字幕）
+python song_dance_pipeline.py assemble --project mymv
+```
+
+- 引擎：**MiniMax H3 开源权重**（社区许可免版税商用；768p、单段 15s、自带立体声音频；12G 显存可跑，4090 每段几分钟）
+- 本机只做 LLM 分镜和 ffmpeg 拼装，**零 GPU 负载**；一条 2 分钟成片（8~10 段）约 ¥1~2
+- 唱歌=歌曲音频参考、跳舞=舞蹈视频参考、虚拟人物=文生视频+跨段角色参考图（H3 多模态输入）
+- ⚠️ 首次使用需在 AutoDL 上按 `h3_remote/README_REMOTE.txt` 装环境；工作流模板如与已装 ComfyUI 节点不匹配，按包内说明导出官方 H3 模板替换
+
+#### 方式 E：3D 全身数字人（浏览器实时渲染）
 
 ```powershell
 conda activate LivePortrait

@@ -1,0 +1,8 @@
+{
+  "_README": "把分镜字段注入工作流的映射：key 是流水线语义，node 对应 h3_workflow_api.json 里的节点 id，field 是该节点 inputs 里要改写的字段。换官方模板后按实际节点号改这里即可，run_segments.py 不用动。",
+  "prompt": { "node": "6", "field": "text" },
+  "length": { "node": "20", "field": "length" },
+  "image": { "node": "10", "field": "image" },
+  "audio": { "node": "12", "field": "audio" },
+  "video": { "node": "14", "field": "video" }
+}

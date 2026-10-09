@@ -1,0 +1,31 @@
+{
+  "_README": "占位工作流（ComfyUI API 格式：节点id -> {class_type, inputs}）。H3 的节点图以你装好的 ComfyUI 版本为准：装好后打开 ComfyUI 网页 → 加载官方 MiniMax H3 模板 → 导出(API) → 把内容替换本文件，并同步修改 h3_patch_map.json 的节点号。节点号只需在本文件内唯一；下划线开头的键会被自动剥离。",
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "PLACEHOLDER_PROMPT", "clip": ["40", 0] }
+  },
+  "10": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "placeholder_char.png" }
+  },
+  "12": {
+    "class_type": "LoadAudio",
+    "inputs": { "audio": "placeholder_song.wav" }
+  },
+  "14": {
+    "class_type": "LoadVideo",
+    "inputs": { "video": "placeholder_dance.mp4" }
+  },
+  "20": {
+    "class_type": "PLACEHOLDER_H3Sampler",
+    "inputs": { "prompt": ["6", 0], "length": 15 }
+  },
+  "30": {
+    "class_type": "Placeholder_VideoCombine",
+    "inputs": { "images": ["20", 0] }
+  },
+  "40": {
+    "class_type": "PLACEHOLDER_ModelLoader",
+    "inputs": {}
+  }
+}
